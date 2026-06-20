@@ -14,7 +14,7 @@
 
 It replicates a realistic enterprise data flow:
 
-> **Data Lake (Raw) → Data Warehouse (Star Schema) → BI Layer (Power BI)**
+> **Data Lake (Raw) → ETL (Python) → Data Warehouse (Star Schema) → BI Layer (Power BI)**
 
 The goal is to demonstrate practical data engineering and financial analytics skills applied to a domain-relevant problem: **budget control and investment performance tracking**, not a generic tutorial dataset.
 
@@ -37,13 +37,13 @@ This project builds a structured, analytics-ready pipeline that answers those qu
 
 | Source | Type | Notes |
 |---|---|---|
-| Exchange rate (USD/PEN) | **Real data** | Sourced from the BCRP (Banco Central de Reserva del Perú) public API. Used to normalize all financial figures to a single reporting currency. |
-| Investments | Simulated | Generated with realistic business patterns (not random/uniform) |
-| Projects | Simulated | 20+ projects across multiple business areas |
-| Budgets | Simulated | Allocated per project/period |
-| Expense execution | Simulated | Transaction-level granularity, with intentional variance patterns |
+| Exchange rate (USD/PEN) | **Real data** | Sourced from the BCRP (Banco Central de Reserva del Perú) public API, series `PD04640PD`. Used to normalize all financial figures to a single reporting currency. |
+| Projects | Simulated | 24 projects across 6 business areas, generated with intentional risk profiles (healthy / over-budget / delayed / stalled) |
+| Investments | Simulated | 1–2 funding investments per project |
+| Budgets | Simulated | 1–4 budget lines per project, allocated by period |
+| Expense execution | Simulated | Transaction-level granularity (498 transactions), with risk-profile-driven variance patterns |
 
-> Simulated data is intentionally generated with realistic "messiness" — inconsistent date formats, unstandardized status labels, missing fields — to mirror how raw enterprise data actually looks before cleaning. This is documented in `/docs/data_quality_rules.md`.
+All simulated data comes from a single reproducible generator (`generate_raw_data.py`, fixed `random.seed(42)`) and is intentionally generated with realistic "messiness" — inconsistent date formats, unstandardized status labels, mixed currency symbols, missing fields — to mirror how raw enterprise data actually looks before cleaning. The exchange rate is the only non-simulated dataset (`fetch_exchange_rate_bcrp.py`), pulled directly from the BCRP's public API.
 
 ---
 
@@ -52,15 +52,34 @@ This project builds a structured, analytics-ready pipeline that answers those qu
 ### 🔵 Data Lake (Raw Layer)
 Raw, unprocessed files as they would arrive from source systems — inconsistent formatting, no validation applied. Single entry point of the pipeline.
 
-### 🟠 Data Warehouse (Structured Layer)
-Cleaned, validated, and modeled using a **star schema**:
+```
+data_lake/raw/
+  proyectos_raw.csv
+  inversiones_raw.csv
+  presupuestos_raw.csv
+  ejecucion_gasto_raw.csv
+  tipo_cambio_raw.csv
+```
 
-- `fact_investments` — transaction-level grain (one row per expense execution event)
-- `dim_project`
-- `dim_area`
-- `dim_time`
-- `dim_currency`
-- `dim_investment`
+### 🟠 Data Warehouse (Structured Layer)
+Cleaned, validated, and modeled using a **star schema** with two transactional fact tables (separated by grain) plus one derived, pre-aggregated fact table:
+
+**Dimensions**
+- `dim_project` — one row per project
+- `dim_area` — canonical business areas (6)
+- `dim_time` — daily calendar grain (`id_time` as `YYYYMMDD`), covering the full date range observed across projects and transactions
+- `dim_currency` — static currency catalog (PEN, USD)
+- `dim_investment` — funding/capital allocation catalog
+
+**Facts**
+- `fact_budget` — grain: **one row per project × budget period**. Budgeted amount, normalized to PEN.
+- `fact_expense_execution` — grain: **one row per individual expense transaction** (the most granular table in the model). Actual amount executed, normalized to PEN, including ~2% legitimate negative transactions (credit notes/reversals), kept as net spend rather than forced positive.
+- `project_metrics` — **derived**, not loaded from raw data: one row per project, pre-calculated from the two fact tables above. Holds the aggregated KPIs (execution %, variance, risk flags) so Power BI doesn't need to recompute them from transactional grain on every visual.
+
+**Support table (not a dimension)**
+- `bridge_exchange_rate` — daily USD→PEN rate, forward-filled to cover every calendar day (the BCRP only publishes rates on business days). Used internally by the ETL to convert amounts to PEN; **not exposed as a navigable table in Power BI**.
+
+> `fact_budget` and `fact_expense_execution` are kept as two separate fact tables rather than one, because they have genuinely different grains (budget period vs. individual transaction) — merging them would mix granularities in a single table, a classic star-schema modeling mistake.
 
 All monetary fields are normalized to **PEN** (reporting base currency) using real BCRP exchange rate data, while preserving the original currency and amount for traceability.
 
@@ -74,7 +93,16 @@ Interactive Power BI dashboard covering financial KPIs, execution tracking, and 
 ```
 Raw Data (Data Lake)
         ↓
-Python (pandas) — Cleaning, validation, currency normalization
+etl_utils.py              — reusable cleaning functions (dates, amounts, text/category normalization)
+        ↓
+build_bridge_exchange_rate.py  — [1/4] forward-filled USD/PEN rate, daily grain
+        ↓
+build_dimensions.py            — [2/4] dim_project, dim_area, dim_time, dim_currency, dim_investment
+        ↓
+build_facts.py                 — [3/4] fact_budget, fact_expense_execution, project_metrics
+        ↓
+run_pipeline.py                — [4/4] orchestrates the 3 steps above + referential integrity
+                                  and business-rule validation + writes etl_log.txt
         ↓
 Structured Star Schema (Data Warehouse)
         ↓
@@ -82,6 +110,8 @@ Power Query — Final refinement layer in Power BI
         ↓
 Power BI Dashboard
 ```
+
+`run_pipeline.py` is a thin orchestrator: it calls the cleaning/loading modules in order, consolidates their logs, runs post-load validations (referential integrity, no orphan foreign keys, no unexpected negative amounts, 1:1 coverage in `project_metrics`), and writes everything to a single `etl_log.txt`.
 
 ---
 
@@ -93,10 +123,11 @@ Power BI Dashboard
 - Budget Variance (absolute and %)
 - Execution Rate (%)
 
-**Risk & control KPIs**
-- Projects Over Budget (execution > 110%)
-- Projects Delayed (past estimated end date, not marked complete)
-- **Projects At Risk** — composite indicator combining time elapsed vs. budget executed, not just a single threshold (see `/docs/kpi_definitions.md` for full logic)
+**Risk & control KPIs** (pre-calculated in `project_metrics`)
+- `is_over_budget` — execution > 100% (flagged "at risk" above 110%)
+- `is_delayed` — past estimated end date, not marked complete
+- `is_stalled` — % of time elapsed exceeds % of budget executed by a meaningful margin
+- `is_at_risk` — composite indicator: true if over-budget (>110%), delayed, or stalled (see `/docs/kpi_definitions.md` for full logic)
 
 **Distribution & trend analysis**
 - Spend distribution by business area
@@ -107,7 +138,7 @@ Power BI Dashboard
 
 ## 🛠️ Tech Stack
 
-- **Python (pandas)** — data generation, cleaning, transformation, currency normalization, DWH load
+- **Python (csv, datetime, re)** — data generation, cleaning, transformation, currency normalization, DWH load (no pandas dependency in the ETL itself — pure standard library for portability)
 - **BCRP public API** — real exchange rate data
 - **Power Query** — final-mile transformation inside Power BI
 - **Power BI** — star schema modeling (relationships), DAX measures, dashboard
@@ -119,18 +150,21 @@ Power BI Dashboard
 ```
 data_lake/
   raw/              # Unprocessed source files
-  processed/        # Cleaned, validated outputs
+  processed/        # etl_log.txt — consolidated run log
 
 data_warehouse/
-  fact/             # fact_investments
-  dim/              # dim_project, dim_area, dim_time, dim_currency, dim_investment
+  dim/              # dim_project, dim_area, dim_time, dim_currency,
+                     # dim_investment, bridge_exchange_rate (support table)
+  fact/             # fact_budget, fact_expense_execution, project_metrics
 
 etl/
   generate_raw_data.py
   fetch_exchange_rate_bcrp.py
-  data_cleaning.py
-  load_warehouse.py
-  etl_log.txt        # Run log: rows processed, errors, rows discarded
+  etl_utils.py                    # shared cleaning functions
+  build_bridge_exchange_rate.py
+  build_dimensions.py
+  build_facts.py
+  run_pipeline.py                 # single entry point
 
 bi/
   investment_dashboard.pbix
@@ -144,12 +178,28 @@ docs/
 
 ---
 
+## 🧹 Data Quality Rules (key decisions)
+
+A few non-obvious cleaning decisions, documented here because they reflect real business judgment rather than default library behavior:
+
+- **Ambiguous dates (`NN-NN-AAAA` with both components ≤12)**: genuinely irresolvable from the numbers alone. Day-month is prioritized over month-day, consistent with the regional (Peru) convention used elsewhere in the source data and documented as an explicit assumption in `etl_log.txt`.
+- **Mixed budget period granularity** (`presupuestos_raw.csv` mixes ISO month, text month, and quarter): periods are normalized to the first day of the period rather than forced into a single granularity — avoids fabricating a monthly breakdown from a quarterly figure that was never actually budgeted that way.
+- **Exchange rate gaps** (BCRP only publishes business days): forward-fill — the last known published rate is carried forward, matching standard accounting practice (LOCF), since no real exchange rate exists for non-business days.
+- **Negative expense transactions** (~2% of rows): kept as legitimate credit notes/reversals rather than discarded or forced positive. `monto_ejecutado_pen` represents **net** spend.
+- **Unrecoverable rows** (invalid project reference, unparseable amount): rejected and counted in `etl_log.txt`, never silently dropped or fabricated.
+
+Full detail in `/docs/data_quality_rules.md`.
+
+---
+
 ## 🧠 Design Decisions Worth Noting
 
 - **Transaction-level fact table grain**, not pre-aggregated — preserves analytical flexibility (e.g., trend analysis, anomaly detection) at the cost of more rows. A deliberate trade-off, not a default.
+- **`fact_budget` and `fact_expense_execution` kept separate** — different grains (period vs. transaction) shouldn't share a fact table.
 - **Investments modeled as a dimension, not part of the fact grain** — separates "capital allocation decisions" from "operational budget execution," which are conceptually different business events.
+- **`project_metrics` as a derived, pre-aggregated table** — risk KPIs are computed once in Python and loaded as a 1-row-per-project table, instead of being recalculated by DAX from transactional grain on every dashboard interaction.
 - **Real exchange rate data** instead of a static/simulated rate — avoids an unrealistic assumption that would undermine the credibility of every PEN-denominated KPI.
-- **Intentional data quality issues in the raw layer** — designed to make the cleaning/transformation step demonstrate actual judgment (handling missing values, standardizing categorical fields, resolving currency formats), rather than operating on already-clean data.
+- **Intentional data quality issues in the raw layer** — designed to make the cleaning/transformation step demonstrate actual judgment (handling missing values, standardizing categorical fields, resolving currency formats, resolving genuinely ambiguous dates), rather than operating on already-clean data.
 
 ---
 
@@ -157,8 +207,8 @@ docs/
 
 **v1.0 (current)**
 - Data Lake + Data Warehouse structure
-- Python-based ETL with logging
-- Core Power BI dashboard with risk KPIs
+- Python-based ETL with logging (`etl_utils.py` + 3 build modules + orchestrator), validated end-to-end against all 5 raw sources
+- Core Power BI dashboard with risk KPIs (in progress)
 
 **v2.0 (planned)**
 - Automated/scheduled pipeline execution
